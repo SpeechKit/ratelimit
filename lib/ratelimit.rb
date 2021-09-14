@@ -3,7 +3,7 @@ require 'redis-namespace'
 
 class Ratelimit
 
-  # Create a Ratelimit object.
+  # Create a RateLimit object.
   #
   # @param [String] key A name to uniquely identify this rate limit. For example, 'emails'
   # @param [Hash] options Options hash
@@ -12,7 +12,7 @@ class Ratelimit
   # @option options [Integer] :bucket_expiry (@bucket_span) How long we keep data in each bucket before it is auto expired. Cannot be larger than the bucket_span.
   # @option options [Redis]   :redis (nil) Redis client if you need to customize connection options
   #
-  # @return [Ratelimit] Ratelimit instance
+  # @return [RateLimit] RateLimit instance
   #
   def initialize(key, options = {})
     @key = key
@@ -25,11 +25,8 @@ class Ratelimit
     if @bucket_expiry > @bucket_span
       raise ArgumentError.new("Bucket expiry cannot be larger than the bucket span")
     end
-    @bucket_count = (@bucket_span / @bucket_interval).round
-    if @bucket_count < 3
-      raise ArgumentError.new("Cannot have less than 3 buckets")
-    end
-    @raw_redis = options[:redis]
+    @redis = options[:redis]
+    @redis_proc = @redis.respond_to?(:to_proc)
   end
 
   # Add to the counter for a given subject.
@@ -39,14 +36,13 @@ class Ratelimit
   #
   # @return [Integer] The counter value
   def add(subject, count = 1)
-    bucket = get_bucket
-    subject = "#{@key}:#{subject}"
-    redis.multi do
-      redis.hincrby(subject, bucket, count)
-      redis.hdel(subject, (bucket + 1) % @bucket_count)
-      redis.hdel(subject, (bucket + 2) % @bucket_count)
-      redis.expire(subject, @bucket_expiry)
-    end.first
+    subject = "#{@key}:#{subject}:#{get_bucket}"
+    with_redis do |redis|
+      redis.multi do
+        redis.incrby(subject, count)
+        redis.expire(subject, @bucket_expiry)
+      end.first
+    end
   end
 
   # Returns the count for a given subject and interval
@@ -55,14 +51,14 @@ class Ratelimit
   # @param [Integer] interval How far back (in seconds) to retrieve activity.
   def count(subject, interval)
     bucket = get_bucket
-    interval = [[interval, @bucket_interval].max, @bucket_span].min
+    interval = [interval, @bucket_interval].max
     count = (interval / @bucket_interval).floor
     subject = "#{@key}:#{subject}"
 
-    keys = (0..count - 1).map do |i|
-      (bucket - i) % @bucket_count
+    keys = (0..count - 1).map {|i| "#{subject}:#{bucket - i}" }
+    with_redis do |redis|
+      return redis.mget(*keys).inject(0) {|a, i| a + i.to_i}
     end
-    return redis.hmget(subject, *keys).inject(0) {|a, i| a + i.to_i}
   end
 
   # Check if the rate limit has been exceeded.
@@ -97,7 +93,6 @@ class Ratelimit
   # @example Send an email as long as we haven't send 5 in the last 10 minutes
   #   ratelimit.exec_with_threshold(email, [:threshold => 5, :interval => 600]) do
   #     send_another_email
-  #     ratelimit.add(email)
   #   end
   def exec_within_threshold(subject, options = {}, &block)
     options[:threshold] ||= 30
@@ -111,10 +106,17 @@ class Ratelimit
   private
 
   def get_bucket(time = Time.now.to_i)
-    ((time % @bucket_span) / @bucket_interval).floor
+    (time / @bucket_interval).floor
   end
 
-  def redis
-    @redis ||= Redis::Namespace.new(:ratelimit, redis: @raw_redis || Redis.new)
+  def with_redis
+    if @redis_proc
+      @redis.call do |redis|
+        yield Redis::Namespace.new(:ratelimit, redis: redis)
+      end
+    else
+      @redis ||= Redis::Namespace.new(:ratelimit, :redis => @redis || Redis.new)
+      yield @redis
+    end
   end
 end

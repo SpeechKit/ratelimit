@@ -1,38 +1,31 @@
 require 'spec_helper'
 
 describe Ratelimit do
-  describe '.initialize' do
-    subject { described_class.new(key, options) }
+  let(:r) { Ratelimit.new("key") }
+  let(:redis) { r.send(:with_redis) { |redis| redis } }
 
-    let(:options) { Hash.new }
-
-    context 'with key' do
-      let(:key) { 'key' }
-
-      context 'with redis option' do
-        let(:redis) { double('redis') }
-        let(:options) { super().merge(redis: redis) }
-
-        it 'wraps redis in redis-namespace' do
-          expect(subject.send(:redis)).to be_instance_of(Redis::Namespace)
-        end
-      end
-    end
+  before :each do
+    @r = r
+    redis.flushdb
   end
 
-  before do
-    @r = Ratelimit.new("key")
-    @r.send(:redis).flushdb
+  context 'when redis is passed as proc' do
+    let!(:r) { Ratelimit.new('key', redis: callable) }
+    let!(:redis) { Redis.new }
+    let!(:callable) do
+      ->&blk {
+        blk.yield redis
+      }
+    end
+
+    it 'returns redis in a with_redis block' do
+      expect(r.instance_variable_get(:@redis_proc)).to eq true
+      expect{ |b| r.send(:with_redis, &b) }.to yield_with_args(Redis::Namespace)
+    end
   end
 
   it "should set_bucket_expiry to the bucket_span if not defined" do
     expect(@r.instance_variable_get(:@bucket_span)).to eq(@r.instance_variable_get(:@bucket_expiry))
-  end
-
-  it "should not allow bucket count less than 3" do
-    expect do
-      Ratelimit.new("key", {:bucket_span => 1, :bucket_interval => 1})
-    end.to raise_error(ArgumentError)
   end
 
   it "should not allow bucket expiry to be larger than the bucket span" do
@@ -52,8 +45,13 @@ describe Ratelimit do
     @r.add("value1")
     expect(@r.count("value1", 1)).to eq(2)
     expect(@r.count("value2", 1)).to eq(0)
+    Timecop.travel(6) do
+      expect(@r.count("value1", 1)).to eq(0)
+      expect(@r.count("value1", 600)).to eq(2)
+    end
     Timecop.travel(600) do
       expect(@r.count("value1", 1)).to eq(0)
+      expect(@r.count("value1", 600)).to eq(0)
     end
   end
 
@@ -122,11 +120,5 @@ describe Ratelimit do
     @r = Ratelimit.new("key", {:bucket_span => 10, bucket_interval: 1})
     @r.add('value1')
     expect(@r.count('value1', 10)).to eql(1)
-  end
-
-  it "counts correctly if interval is greater than bucket_span" do
-    @r = Ratelimit.new("key", { bucket_span: 10, bucket_interval: 1})
-    @r.add('value1')
-    expect(@r.count('value1', 40)).to eql(1)
   end
 end
