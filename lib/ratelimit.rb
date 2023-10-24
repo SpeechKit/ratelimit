@@ -38,9 +38,9 @@ class Ratelimit
   def add(subject, count = 1)
     subject = "#{@key}:#{subject}:#{get_bucket}"
     with_redis do |redis|
-      redis.multi do
-        redis.incrby(subject, count)
-        redis.expire(subject, @bucket_expiry)
+      redis.multi do |transaction|
+        transaction.incrby(subject, count)
+        transaction.expire(subject, @bucket_expiry)
       end.first
     end
   end
